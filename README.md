@@ -86,6 +86,41 @@ make build
 
 > Tip: use `make release` (or `cargo build --release`) when shipping the binary to an IDE like Zed. The release build lives at `target/release/codex-acp`.
 
+### Cross Compilation
+
+From macOS, the targets that worked cleanly in this repository were:
+
+```bash
+# macOS x64
+rustup target add --toolchain 1.91 x86_64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
+
+# Windows x64 (MSVC ABI)
+rustup target add --toolchain 1.91 x86_64-pc-windows-msvc
+cargo install cargo-xwin
+XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=./.cache/cargo-xwin \
+  cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+For Linux targets, this project currently depends on crates (`openssl-sys`, `ring`) that did not cross-build reliably from macOS with `cargo-zigbuild` in this checkout. Use `cross` instead:
+
+```bash
+cargo install cross
+
+# Requires Docker
+cross build --release --target x86_64-unknown-linux-gnu
+cross build --release --target aarch64-unknown-linux-gnu
+```
+
+Equivalent `make` targets are available:
+
+```bash
+make release-macos-x64
+make release-windows-x64
+make release-linux-x64
+make release-linux-arm64
+```
+
 ### Configuration in [Zed](https://zed.dev)
 
 > Add this configuration to zed settings.
