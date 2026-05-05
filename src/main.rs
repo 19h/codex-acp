@@ -23,6 +23,9 @@ async fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("--acp-fs-mcp") {
         return codex_acp::fs::run_mcp_server().await;
     }
+    if env::args().nth(1).as_deref() == Some("--acp-sse-mcp") {
+        return codex_acp::mcp_sse_proxy::run_from_env();
+    }
 
     let outgoing = io::stdout().compat_write();
     let incoming = io::stdin().compat();

@@ -86,28 +86,76 @@ impl CodexAgent {
         )
     }
 
+    /// Build a stdio proxy for legacy SSE MCP servers.
+    ///
+    /// Codex Core currently supports stdio and streamable HTTP MCP transports,
+    /// while ACP can still pass legacy SSE servers. The proxy speaks stdio to
+    /// Codex Core and forwards messages to the ACP-provided SSE endpoint.
+    fn build_legacy_sse_proxy_server(
+        name: String,
+        url: String,
+        headers: Vec<HttpHeader>,
+        startup_timeout: Option<Duration>,
+        tool_timeout: Option<Duration>,
+    ) -> Result<(String, McpServerConfig), Error> {
+        let exe_path = env::current_exe().map_err(|err| {
+            Error::internal_error().data(format!("failed to locate agent binary: {err}"))
+        })?;
+
+        let http_headers = headers
+            .iter()
+            .map(|header| (header.name.clone(), header.value.clone()))
+            .collect::<HashMap<_, _>>();
+        let headers_json = serde_json::to_string(&http_headers).map_err(|err| {
+            Error::internal_error().data(format!("failed to encode SSE MCP headers: {err}"))
+        })?;
+
+        let mut env = HashMap::new();
+        env.insert("ACP_MCP_SSE_URL".into(), url);
+        env.insert("ACP_MCP_SSE_HEADERS".into(), headers_json);
+
+        Ok((
+            name,
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: exe_path.to_string_lossy().into_owned(),
+                    args: vec!["--acp-sse-mcp".into()],
+                    env: Some(env),
+                    env_vars: vec![],
+                    cwd: None,
+                },
+                enabled: true,
+                startup_timeout_sec: startup_timeout,
+                tool_timeout_sec: tool_timeout,
+                enabled_tools: None,
+                disabled_tools: None,
+            },
+        ))
+    }
+
     /// Build an MCP server configuration from an ACP McpServer specification.
     pub(super) fn build_mcp_server(
         &self,
         server: McpServer,
         startup_timeout: Option<Duration>,
         tool_timeout: Option<Duration>,
-    ) -> Option<(String, McpServerConfig)> {
+    ) -> Result<Option<(String, McpServerConfig)>, Error> {
         match server {
-            McpServer::Http(http) => Some(Self::build_streamable_http_server(
+            McpServer::Http(http) => Ok(Some(Self::build_streamable_http_server(
                 http.name,
                 http.url.to_string(),
                 http.headers,
                 startup_timeout,
                 tool_timeout,
-            )),
-            McpServer::Sse(sse) => Some(Self::build_streamable_http_server(
+            ))),
+            McpServer::Sse(sse) => Self::build_legacy_sse_proxy_server(
                 sse.name,
                 sse.url.to_string(),
                 sse.headers,
                 startup_timeout,
                 tool_timeout,
-            )),
+            )
+            .map(Some),
             McpServer::Stdio(stdio) => {
                 let env = if stdio.env.is_empty() {
                     None
@@ -120,7 +168,7 @@ impl CodexAgent {
                             .collect::<HashMap<_, _>>(),
                     )
                 };
-                Some((
+                Ok(Some((
                     stdio.name,
                     McpServerConfig {
                         transport: McpServerTransportConfig::Stdio {
@@ -136,10 +184,10 @@ impl CodexAgent {
                         enabled_tools: None,
                         disabled_tools: None,
                     },
-                ))
+                )))
             }
             // Handle any future McpServer variants
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -185,11 +233,13 @@ impl CodexAgent {
         let tool_timeout = Some(Duration::from_secs(30));
 
         // Add requested MCP servers
-        session_config.mcp_servers.extend(
-            mcp_servers
-                .into_iter()
-                .filter_map(|srv| self.build_mcp_server(srv, startup_timeout, tool_timeout)),
-        );
+        for srv in mcp_servers {
+            if let Some((name, config)) =
+                self.build_mcp_server(srv, startup_timeout, tool_timeout)?
+            {
+                session_config.mcp_servers.insert(name, config);
+            }
+        }
 
         // Add acp_fs MCP server if bridge is available
         if let Some(bridge) = &self.fs_bridge {

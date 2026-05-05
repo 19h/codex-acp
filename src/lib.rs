@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod fs;
 pub mod logging;
+pub mod mcp_sse_proxy;
 
 // Common re-exports for convenience.
 pub use agent::{CodexAgent, SessionManager};
