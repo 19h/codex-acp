@@ -18,8 +18,11 @@ use codex_app_server_protocol::AuthMode;
 use codex_core::{
     AuthManager, ConversationManager, NewConversation,
     config::{Config, profile::ConfigProfile},
+    models_manager::{manager::ModelsManager, model_presets::all_model_presets},
     protocol::{Op, SessionSource},
 };
+use codex_protocol::openai_models::ModelPreset as CodexModelPreset;
+use serde::Deserialize;
 use tokio::{
     sync::{mpsc::UnboundedSender, oneshot},
     task,
@@ -33,6 +36,18 @@ use super::{
     commands,
     session_manager::{SessionManager, SessionState},
 };
+
+#[derive(Clone, Deserialize)]
+struct CachedCodexModelInfo {
+    slug: String,
+    display_name: String,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexModelsCache {
+    models: Vec<CachedCodexModelInfo>,
+}
 
 /// Operations that require client interaction.
 ///
@@ -62,6 +77,7 @@ pub struct CodexAgent {
     pub(super) config: Config,
     pub(super) profiles: HashMap<String, ConfigProfile>,
     pub(super) auth_manager: Arc<RwLock<Arc<AuthManager>>>,
+    pub(super) models_manager: Arc<ModelsManager>,
     pub(super) client_tx: UnboundedSender<ClientOp>,
     pub(super) fs_bridge: Option<Arc<FsBridge>>,
 }
@@ -85,6 +101,7 @@ impl CodexAgent {
             false,
             config.cli_auth_credentials_store_mode,
         );
+        let models_manager = Arc::new(ModelsManager::new(auth.clone()));
         let conversation_manager = ConversationManager::new(auth.clone(), SessionSource::Unknown);
 
         let session_manager =
@@ -95,9 +112,49 @@ impl CodexAgent {
             config,
             profiles,
             auth_manager: Arc::new(RwLock::new(auth)),
+            models_manager,
             client_tx,
             fs_bridge,
         }
+    }
+
+    async fn available_codex_models(&self) -> Vec<CodexModelPreset> {
+        if self.config.model_provider_id != "openai" {
+            return Vec::new();
+        }
+
+        let mut models = self.models_manager.list_models(&self.config).await;
+        let mut seen = models
+            .iter()
+            .map(|preset| preset.model.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if let Ok(contents) =
+            tokio::fs::read(self.config.codex_home.join("models_cache.json")).await
+            && let Ok(cache) = serde_json::from_slice::<CodexModelsCache>(&contents)
+        {
+            for cached_model in cache.models {
+                if seen.insert(cached_model.slug.clone()) {
+                    models.push(CodexModelPreset {
+                        id: cached_model.slug.clone(),
+                        model: cached_model.slug,
+                        display_name: cached_model.display_name,
+                        description: cached_model.description.unwrap_or_default(),
+                        default_reasoning_effort: Default::default(),
+                        supported_reasoning_efforts: Vec::new(),
+                        is_default: false,
+                        upgrade: None,
+                        show_in_picker: true,
+                        supported_in_api: true,
+                    });
+                }
+            }
+        }
+        for preset in all_model_presets().iter() {
+            if seen.insert(preset.model.clone()) {
+                models.push(preset.clone());
+            }
+        }
+        models
     }
 
     /// Initialize the agent and return supported capabilities and authentication methods.
@@ -291,15 +348,16 @@ impl CodexAgent {
             });
         }
 
-        // Build models response only for custom providers
-        let models = if utils::is_custom_provider(&self.config.model_provider_id) {
-            Some(SessionModelState::new(
-                utils::current_model_id_from_config(&self.config),
-                utils::available_models_from_profiles(&self.config, &self.profiles),
-            ))
+        let codex_models = self.available_codex_models().await;
+        let available_models = if utils::is_custom_provider(&self.config.model_provider_id) {
+            utils::available_models_from_profiles(&self.config, &self.profiles)
         } else {
-            None
+            utils::available_models_from_codex_presets(&self.config, &codex_models)
         };
+        let models = Some(SessionModelState::new(
+            utils::current_model_id_for_config(&self.config, &codex_models),
+            available_models,
+        ));
 
         Ok(
             NewSessionResponse::new(SessionId::new(acp_session_id.clone()))
@@ -323,24 +381,22 @@ impl CodexAgent {
             (state.current_mode.clone(), state.current_model.clone())
         };
 
+        let codex_models = self.available_codex_models().await;
+
         // Use stored model or derive from config
         let current_model_id = if let Some(ref stored_model) = _current_model {
-            // If model was set via set_session_model, it's already in "model@provider" format
+            // If model was set via set_session_model, it's already in ACP provider@model format.
             ModelId::new(stored_model.clone())
         } else {
-            // Otherwise, construct from current config
-            utils::current_model_id_from_config(&self.config)
+            utils::current_model_id_for_config(&self.config, &codex_models)
         };
 
-        // Build models response only for custom providers
-        let models = if utils::is_custom_provider(&self.config.model_provider_id) {
-            Some(SessionModelState::new(
-                current_model_id,
-                utils::available_models_from_profiles(&self.config, &self.profiles),
-            ))
+        let available_models = if utils::is_custom_provider(&self.config.model_provider_id) {
+            utils::available_models_from_profiles(&self.config, &self.profiles)
         } else {
-            None
+            utils::available_models_from_codex_presets(&self.config, &codex_models)
         };
+        let models = Some(SessionModelState::new(current_model_id, available_models));
 
         Ok(LoadSessionResponse::new()
             .modes(SessionModeState::new(
@@ -389,34 +445,29 @@ impl CodexAgent {
     /// This preserves the current approval and sandbox settings while updating
     /// the model and its associated reasoning effort level.
     ///
-    /// This method is only available when using a custom (non-builtin) provider.
     pub(super) async fn set_session_model(
         &self,
         args: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
         info!(?args, "Received set session model request");
 
-        // Check if current provider is custom
-        if !utils::is_custom_provider(&self.config.model_provider_id) {
-            return Err(Error::invalid_params().data(
-                "set_session_model is only available when using a custom provider. Current provider is a builtin provider.",
-            ));
-        }
-
         // Parse and validate the model_id, extracting provider, model name, and effort
-        let (provider_id, model_name, effort) =
-            utils::parse_and_validate_model(&self.config, &self.profiles, &args.model_id)
-                .ok_or_else(|| {
-                    Error::invalid_params()
-                        .data("invalid model id format or provider/model not found")
-                })?;
-
-        // Ensure the requested model is also from a custom provider
-        if !utils::is_custom_provider(&provider_id) {
-            return Err(Error::invalid_params().data(
-                "Cannot switch to a builtin provider model. Only custom provider models are allowed.",
-            ));
-        }
+        let codex_models = self.available_codex_models().await;
+        let (provider_id, model_name, effort) = utils::parse_and_validate_model(
+            &self.config,
+            &self.profiles,
+            &codex_models,
+            &args.model_id,
+        )
+        .ok_or_else(|| {
+            Error::invalid_params().data("invalid model id format or provider/model not found")
+        })?;
+        let acp_model_id = format!("{}@{}", provider_id, model_name);
+        let core_model = if provider_id == "openai" {
+            model_name.clone()
+        } else {
+            acp_model_id.clone()
+        };
 
         self.session_manager
             .apply_context_override(
@@ -425,12 +476,12 @@ impl CodexAgent {
                     cwd: None,
                     approval_policy: Some(state.current_approval),
                     sandbox_policy: Some(state.current_sandbox.clone()),
-                    model: Some(format!("{}@{}", provider_id, model_name)),
+                    model: Some(core_model.clone()),
                     effort: Some(effort),
                     summary: None,
                 },
                 |state| {
-                    state.current_model = Some(format!("{}@{}", provider_id, model_name));
+                    state.current_model = Some(acp_model_id.clone());
                     state.current_effort = effort;
                 },
             )

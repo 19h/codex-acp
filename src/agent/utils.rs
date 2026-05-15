@@ -12,7 +12,10 @@ use codex_core::{
     config::{Config, profile::ConfigProfile},
     protocol::McpInvocation,
 };
-use codex_protocol::{openai_models::ReasoningEffort, parse_command::ParsedCommand};
+use codex_protocol::{
+    openai_models::{ModelPreset as CodexModelPreset, ReasoningEffort},
+    parse_command::ParsedCommand,
+};
 
 /// All available approval presets used to derive ACP session modes.
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
@@ -218,6 +221,21 @@ pub fn current_model_id_from_config(config: &Config) -> ModelId {
     ModelId::new(format!("{}@{}", config.model_provider_id, model_name))
 }
 
+/// Return the current ACP model id, falling back to Codex's default preset when
+/// the OpenAI provider is letting Codex choose the model.
+pub fn current_model_id_for_config(config: &Config, codex_presets: &[CodexModelPreset]) -> ModelId {
+    if config.model_provider_id == "openai"
+        && config.model.as_deref().unwrap_or_default().is_empty()
+        && let Some(preset) = codex_presets
+            .iter()
+            .find(|preset| preset.is_default)
+            .or_else(|| codex_presets.first())
+    {
+        return ModelId::new(format!("openai@{}", preset.model));
+    }
+    current_model_id_from_config(config)
+}
+
 /// Build a `ModelInfo` for display to the client.
 fn build_model_info(config: &Config, provider_id: &str, model_name: &str) -> Option<ModelInfo> {
     let provider_info = config.model_providers.get(provider_id)?;
@@ -290,10 +308,56 @@ pub fn available_models_from_profiles(
     models
 }
 
+fn build_openai_model_info(preset: &CodexModelPreset) -> ModelInfo {
+    ModelInfo::new(
+        ModelId::new(format!("openai@{}", preset.model)),
+        preset.display_name.clone(),
+    )
+    .description(preset.description.clone())
+}
+
+/// Return ACP `ModelInfo` entries derived from Codex's model manager presets.
+pub fn available_models_from_codex_presets(
+    config: &Config,
+    presets: &[CodexModelPreset],
+) -> Vec<ModelInfo> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+
+    if config.model_provider_id != "openai" {
+        return models;
+    }
+
+    if let Some(model_name) = config.model.as_deref() {
+        let model_id = format!("openai@{model_name}");
+        if let Some(preset) = presets.iter().find(|preset| preset.model == model_name) {
+            models.push(build_openai_model_info(preset));
+        } else {
+            models.push(
+                ModelInfo::new(ModelId::new(model_id.clone()), model_name.to_string())
+                    .description("Current Codex model from config".to_string()),
+            );
+        }
+        seen.insert(model_id);
+    }
+
+    for preset in presets {
+        let model_id = format!("openai@{}", preset.model);
+        if seen.contains(&model_id) {
+            continue;
+        }
+        seen.insert(model_id);
+        models.push(build_openai_model_info(preset));
+    }
+
+    models
+}
+
 /// Parse and validate a model id and return components (provider, model, effort).
 pub fn parse_and_validate_model(
     config: &Config,
     profiles: &HashMap<String, ConfigProfile>,
+    codex_presets: &[CodexModelPreset],
     model_id: &ModelId,
 ) -> Option<(String, String, Option<ReasoningEffort>)> {
     let id_str = model_id.0.as_ref();
@@ -311,6 +375,18 @@ pub fn parse_and_validate_model(
         && config.model.as_deref() == Some(model_name.as_str())
     {
         return Some((provider_id, model_name, config.model_reasoning_effort));
+    }
+
+    if provider_id == "openai"
+        && let Some(preset) = codex_presets
+            .iter()
+            .find(|preset| preset.model == model_name)
+    {
+        return Some((
+            provider_id,
+            model_name,
+            Some(preset.default_reasoning_effort),
+        ));
     }
 
     // Search in profiles for matching provider@model combination

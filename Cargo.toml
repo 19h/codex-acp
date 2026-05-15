@@ -16,7 +16,9 @@ codex-app-server-protocol = { git = "https://github.com/openai/codex", branch = 
 codex-common = { git = "https://github.com/openai/codex", branch = "main", features = [
   "cli",
 ] }
-codex-core = { git = "https://github.com/openai/codex", branch = "main" }
+codex-core = { git = "https://github.com/openai/codex", branch = "main", features = [
+  "test-support",
+] }
 codex-protocol = { git = "https://github.com/openai/codex", branch = "main" }
 codex-utils-absolute-path = { git = "https://github.com/openai/codex", branch = "main" }
 diffy = { version = "0.4.2" }
